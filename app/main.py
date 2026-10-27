@@ -1,51 +1,76 @@
+"""Churn prediction API. Accepts raw customer attributes, as they appear in the dataset."""
+import json
+from typing import Literal
+
+import joblib
+import pandas as pd
 from fastapi import FastAPI
-from pydantic import BaseModel
-import pickle
-import numpy as np
+from pydantic import BaseModel, ConfigDict, Field
 
-app = FastAPI(title="Churn Prediction API")
+from churn.pipeline import FEATURES, METADATA_PATH, MODEL_PATH
 
-with open("model.pkl", "rb") as f:
-    model = pickle.load(f)
+model = joblib.load(MODEL_PATH)
+metadata = json.loads(METADATA_PATH.read_text())
+THRESHOLD = metadata["threshold"]
 
-class CustomerData(BaseModel):
-    tenure: float
-    MonthlyCharges: float
-    TotalCharges: float
-    Contract: int
-    gender: int = 0
-    SeniorCitizen: int = 0
-    Partner: int = 0
-    Dependents: int = 0
-    PhoneService: int = 1
-    MultipleLines: int = 0
-    InternetService: int = 1
-    OnlineSecurity: int = 0
-    OnlineBackup: int = 0
-    DeviceProtection: int = 0
-    TechSupport: int = 0
-    StreamingTV: int = 0
-    StreamingMovies: int = 0
-    PaperlessBilling: int = 1
-    PaymentMethod: int = 0
+YesNo = Literal["Yes", "No"]
+AddOn = Literal["Yes", "No", "No internet service"]
+
+EXAMPLE = {
+    "gender": "Female", "SeniorCitizen": 0, "Partner": "No", "Dependents": "No",
+    "tenure": 3, "PhoneService": "Yes", "MultipleLines": "No",
+    "InternetService": "Fiber optic", "OnlineSecurity": "No", "OnlineBackup": "No",
+    "DeviceProtection": "No", "TechSupport": "No", "StreamingTV": "Yes",
+    "StreamingMovies": "No", "Contract": "Month-to-month", "PaperlessBilling": "Yes",
+    "PaymentMethod": "Electronic check", "MonthlyCharges": 85.5,
+}
+
+
+class Customer(BaseModel):
+    model_config = ConfigDict(json_schema_extra={"examples": [EXAMPLE]})
+
+    gender: Literal["Female", "Male"]
+    SeniorCitizen: Literal[0, 1]
+    Partner: YesNo
+    Dependents: YesNo
+    tenure: int = Field(ge=0, le=120, description="Months with the company")
+    PhoneService: YesNo
+    MultipleLines: Literal["Yes", "No", "No phone service"]
+    InternetService: Literal["DSL", "Fiber optic", "No"]
+    OnlineSecurity: AddOn
+    OnlineBackup: AddOn
+    DeviceProtection: AddOn
+    TechSupport: AddOn
+    StreamingTV: AddOn
+    StreamingMovies: AddOn
+    Contract: Literal["Month-to-month", "One year", "Two year"]
+    PaperlessBilling: YesNo
+    PaymentMethod: Literal["Electronic check", "Mailed check",
+                           "Bank transfer (automatic)", "Credit card (automatic)"]
+    MonthlyCharges: float = Field(gt=0, le=500)
+
+
+class Prediction(BaseModel):
+    churn_probability: float
+    high_risk: bool
+    threshold: float
+
+
+app = FastAPI(title="Churn Prediction API", version="2.0")
+
 
 @app.get("/")
-def root():
-    return {"message": "Churn Prediction API is running!"}
+def root() -> dict:
+    return {"message": "Churn Prediction API. Open /docs to try it."}
 
-@app.post("/predict")
-def predict(data: CustomerData):
-    features = np.array([[
-        data.gender, data.SeniorCitizen, data.Partner, data.Dependents,
-        data.tenure, data.PhoneService, data.MultipleLines, data.InternetService,
-        data.OnlineSecurity, data.OnlineBackup, data.DeviceProtection,
-        data.TechSupport, data.StreamingTV, data.StreamingMovies,
-        data.Contract, data.PaperlessBilling, data.PaymentMethod,
-        data.MonthlyCharges, data.TotalCharges
-    ]])
-    prediction = model.predict(features)[0]
-    probability = model.predict_proba(features)[0][1]
-    return {
-        "churn": bool(prediction),
-        "churn_probability": round(float(probability), 3)
-    }
+
+@app.get("/health")
+def health() -> dict:
+    return {"status": "ok", "model": metadata["model"], "test_roc_auc": metadata["metrics"]["test_roc_auc"]}
+
+
+@app.post("/predict", response_model=Prediction)
+def predict(customer: Customer) -> Prediction:
+    row = pd.DataFrame([customer.model_dump()])[FEATURES]
+    proba = float(model.predict_proba(row)[0, 1])
+    return Prediction(churn_probability=round(proba, 4), high_risk=proba >= THRESHOLD, threshold=THRESHOLD)
